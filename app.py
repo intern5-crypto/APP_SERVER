@@ -1,0 +1,291 @@
+# CRITICAL: eventlet must be imported and monkey-patched before any other imports
+import eventlet
+eventlet.monkey_patch()
+
+import os
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, emit, join_room
+from pymongo import MongoClient
+import certifi
+from datetime import datetime
+from bson.objectid import ObjectId
+from werkzeug.security import generate_password_hash, check_password_hash
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'my_secret_key'
+
+# --- SCALABILITY ENHANCEMENTS ---
+# async_mode="eventlet": Uses cooperative yielding instead of OS threads (handles 10k+ connections easily)
+# max_http_buffer_size: Set to 20MB to allow image/video attachments without crashing
+# ping_timeout / ping_interval: Extended to prevent users from dropping during heavy server load
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode="eventlet",
+    ping_timeout=60,
+    ping_interval=25,
+    max_http_buffer_size=20 * 1024 * 1024 
+)
+
+# --- DATABASE CONNECTION ---
+# maxPoolSize=1000: Prevents PyMongo from bottlenecking when 1000 users send messages at the exact same time
+# waitQueueTimeoutMS: If the pool is full, waits 5 seconds before failing instead of crashing immediately
+MONGO_URI = "mongodb+srv://Intership:rohan2004@cluster0.6rqtgnz.mongodb.net/"
+client = MongoClient(
+    MONGO_URI, 
+    tlsCAFile=certifi.where(),
+    maxPoolSize=1000,
+    waitQueueTimeoutMS=5000
+)
+db = client.chat_database
+
+print("\n" + "="*50)
+print("🚀 MONGODB CONNECTED: HIGH CONCURRENCY MODE")
+db.users.update_many({}, {"$set": {"online": False, "sid": None}})
+print("🧹 Cleared leftover online sessions")
+print("="*50 + "\n")
+
+
+# --- HTTP API ROUTES ---
+
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({"status": True, "message": "High-Performance Chat Backend Running!"}), 200
+
+@app.route("/signup", methods=["POST"])
+def api_signup():
+    try:
+        data = request.get_json()
+        phone = data.get("phone")
+        password = data.get("password")
+        name = data.get("name")
+        image = data.get("image")
+        
+        if not phone or not password:
+            return jsonify({"status": False, "message": "Phone and password are required"}), 400
+        
+        if db.users.find_one({"phone": phone}):
+            return jsonify({"status": False, "message": "User already exists"}), 409
+            
+        hashed_password = generate_password_hash(password)
+        user_id = db.users.insert_one({
+            "phone": phone,
+            "password": hashed_password,
+            "name": name,
+            "image": image,
+            "online": False,
+            "sid": None,
+            "identityPublic": None,       
+            "signedPreKeyPublic": None,
+            "pqPreKeyPublic": None 
+        }).inserted_id
+        
+        return jsonify({"status": True, "message": "User created", "userId": str(user_id), "name": name}), 201
+    except Exception as e:
+        return jsonify({"status": False, "message": "Internal Server Error"}), 500
+
+@app.route("/login", methods=["POST"])
+def api_login():
+    try:
+        data = request.get_json()
+        phone = data.get("phone")
+        password = data.get("password")
+        
+        user = db.users.find_one({"phone": phone})
+        
+        if user and check_password_hash(user['password'], password):
+            db.users.update_one({"_id": user["_id"]}, {"$set": {"online": False, "sid": None}})
+            return jsonify({
+                "status": True,
+                "userId": str(user["_id"]),
+                "name": user.get("name"),
+                "image": user.get("image")
+            }), 200
+            
+        return jsonify({"status": False, "message": "Invalid Credentials"}), 401
+    except Exception as e:
+        return jsonify({"status": False, "message": "Internal Server Error"}), 500
+
+@app.route("/users", methods=["GET"])
+def get_users():
+    try:
+        current_user_id = request.args.get("userId")
+        if current_user_id and ObjectId.is_valid(current_user_id):
+            query = {"_id": {"$ne": ObjectId(current_user_id)}}
+        else:
+            query = {}
+        
+        users = []
+        for user in db.users.find(query):
+            users.append({
+                "id": str(user["_id"]),
+                "name": user.get("name"),
+                "phone": user.get("phone"),
+                "image": user.get("image"),
+                "online": user.get("online", False)
+            })
+        return jsonify(users), 200
+    except Exception as e:
+        return jsonify([]), 500
+
+@app.route("/messages", methods=["GET"])
+def get_messages():
+    try:
+        sender = request.args.get("sender")
+        receiver = request.args.get("receiver")
+        
+        messages = list(db.messages.find({
+            "$or": [
+                {"sender": sender, "receiver": receiver},
+                {"sender": receiver, "receiver": sender}
+            ]
+        }).sort("timestamp", 1))
+
+        output = []
+        for msg in messages:
+            msg_data = {k: v for k, v in msg.items() if k not in ["_id", "timestamp"]}
+            msg_data["dateTime"] = msg["timestamp"].strftime("%I:%M %p")
+            output.append(msg_data)
+            
+        return jsonify(output), 200
+    except Exception as e:
+        return jsonify([]), 500
+
+
+# --- HYBRID X3DH KEY REGISTRY ENDPOINTS ---
+
+@app.route("/keys/upload", methods=["POST"])
+def upload_keys():
+    try:
+        data = request.get_json(force=True) 
+        phone = data.get("phone")
+        
+        identity_public = data.get("identityPublic") or data.get("identityKey") or data.get("identity_public")
+        signed_prekey_public = data.get("signedPreKeyPublic") or data.get("signedPreKey") or data.get("signed_prekey_public")
+        pq_prekey_public = data.get("pqPreKeyPublic")
+
+        if not phone or not identity_public or not signed_prekey_public or not pq_prekey_public:
+            return jsonify({"status": False, "message": "Missing key data"}), 400
+
+        db.users.update_one(
+            {"phone": phone},
+            {"$set": {
+                "identityPublic": identity_public,
+                "signedPreKeyPublic": signed_prekey_public,
+                "pqPreKeyPublic": pq_prekey_public
+            }}
+        )
+        return jsonify({"status": True, "message": "Keys uploaded successfully"}), 200
+    except Exception as e:
+        return jsonify({"status": False, "message": "Internal Server Error"}), 500
+
+@app.route("/keys", methods=["GET"])
+def get_keys():
+    try:
+        phone = request.args.get("phone") 
+        user = db.users.find_one({"phone": phone})
+        if user and user.get("identityPublic") and user.get("pqPreKeyPublic"):
+            return jsonify({
+                "phone": user["phone"],
+                "identityPublic": user["identityPublic"],
+                "signedPreKeyPublic": user["signedPreKeyPublic"],
+                "pqPreKeyPublic": user["pqPreKeyPublic"], 
+                "identity_public": user["identityPublic"],
+                "signed_prekey_public": user["signedPreKeyPublic"]
+            }), 200
+        return jsonify({"status": False, "message": "Keys not found"}), 404
+    except Exception as e:
+        return jsonify({"status": False, "message": "Internal Server Error"}), 500
+
+
+# --- SOCKET.IO EVENTS (BLIND RELAY WITH TERMINAL LOGGING) ---
+
+@socketio.on("connect")
+def handle_connect():
+    print(f"🟢 [CONNECT] New device connected (SID: {request.sid})")
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    user = db.users.find_one({"sid": request.sid})
+    if user:
+        phone = user.get("phone", "Unknown")
+        name = user.get("name", "Unknown")
+        print(f"🔴 [OFFLINE] {name} ({phone}) went offline. (SID: {request.sid})")
+        db.users.update_one({"_id": user["_id"]}, {"$set": {"online": False, "sid": None}})
+    else:
+        print(f"🔴 [DISCONNECT] Unregistered device disconnected. (SID: {request.sid})")
+
+@socketio.on("register")
+def handle_register(data):
+    phone = data.get("phone")
+    if phone:
+        join_room(phone) 
+        db.users.update_one({"phone": phone}, {"$set": {"online": True, "sid": request.sid}})
+        
+        user = db.users.find_one({"phone": phone})
+        name = user.get("name", "Unknown") if user else "Unknown"
+        print(f"✅ [ONLINE] {name} ({phone}) is now registered and online.")
+        
+        # Deliver pending messages
+        pending_msgs = list(db.messages.find({"receiver": phone, "status": 1}))
+        if pending_msgs:
+            print(f"📬 [DELIVERY] Delivering {len(pending_msgs)} pending message(s) to {phone}...")
+            for msg in pending_msgs:
+                delivery_payload = {k: v for k, v in msg.items() if k not in ["_id", "timestamp"]}
+                delivery_payload["dateTime"] = msg["timestamp"].strftime("%I:%M %p")
+                
+                emit("receive_message", delivery_payload, room=phone)
+                emit("message_status", {"status": 2}, room=msg["sender"])
+                db.messages.update_one({"_id": msg["_id"]}, {"$set": {"status": 2}})
+
+@socketio.on("send_message")
+def handle_message(data):
+    sender = data.get("sender")    
+    receiver = data.get("receiver") 
+    msg_type = data.get("type", "text") # Identifies if it's text, image, file, etc.
+    timestamp = datetime.now()
+    
+    print(f"💬 [MESSAGE] {sender} sent a [{msg_type}] message to {receiver}.")
+    
+    db_payload = data.copy()
+    db_payload["timestamp"] = timestamp
+    db_payload["status"] = 1
+    
+    # Insert directly into DB (Atomicity prevents collisions)
+    msg_id = db.messages.insert_one(db_payload).inserted_id
+
+    receiver_user = db.users.find_one({"phone": receiver})
+    
+    if receiver_user and receiver_user.get("online"):
+        emit_payload = data.copy()
+        emit_payload["dateTime"] = timestamp.strftime("%I:%M %p")
+        
+        emit("receive_message", emit_payload, room=receiver)
+        emit("message_status", {"status": 2}, room=sender)
+        db.messages.update_one({"_id": msg_id}, {"$set": {"status": 2}})
+        print(f"⚡ [DELIVERED] Message immediately delivered to {receiver} (Online).")
+    else:
+        emit("message_status", {"status": 1}, room=sender)
+        print(f"⏳ [STORED] {receiver} is offline. Message saved in database for later.")
+
+@socketio.on("message_read")
+def handle_read(data):
+    sender = data.get("sender")    
+    receiver = data.get("receiver") 
+    
+    print(f"👀 [READ RECEIPT] {receiver} read messages from {sender}.")
+    
+    # Update many is faster than updating one by one
+    result = db.messages.update_many(
+        {"sender": sender, "receiver": receiver, "status": {"$lt": 3}},
+        {"$set": {"status": 3}}
+    )
+    if result.modified_count > 0:
+        emit("message_status", {"status": 3}, room=sender)
+        print(f"🔄 [UPDATED] Marked {result.modified_count} message(s) as read in database.")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    print(f"🚀 SERVER STARTING ON PORT {port} WITH EVENTLET WORKERS...")
+    # socketio.run automatically detects and uses the eventlet server because we imported it
+    socketio.run(app, host="0.0.0.0", port=port, debug=False, use_reloader=False)
