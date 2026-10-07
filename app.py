@@ -15,9 +15,6 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'my_secret_key'
 
 # --- SCALABILITY ENHANCEMENTS ---
-# async_mode="eventlet": Uses cooperative yielding instead of OS threads (handles 10k+ connections easily)
-# max_http_buffer_size: Set to 20MB to allow image/video attachments without crashing
-# ping_timeout / ping_interval: Extended to prevent users from dropping during heavy server load
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
@@ -28,8 +25,6 @@ socketio = SocketIO(
 )
 
 # --- DATABASE CONNECTION ---
-# maxPoolSize=1000: Prevents PyMongo from bottlenecking when 1000 users send messages at the exact same time
-# waitQueueTimeoutMS: If the pool is full, waits 5 seconds before failing instead of crashing immediately
 MONGO_URI = "mongodb+srv://Intership:rohan2004@cluster0.6rqtgnz.mongodb.net/"
 client = MongoClient(
     MONGO_URI, 
@@ -39,12 +34,11 @@ client = MongoClient(
 )
 db = client.chat_database
 
-print("\n" + "="*50)
+print("\n" + "="*75)
 print("🚀 MONGODB CONNECTED: HIGH CONCURRENCY MODE")
 db.users.update_many({}, {"$set": {"online": False, "sid": None}})
 print("🧹 Cleared leftover online sessions")
-print("="*50 + "\n")
-
+print("="*75 + "\n")
 
 # --- HTTP API ROUTES ---
 
@@ -110,21 +104,52 @@ def api_login():
 def get_users():
     try:
         current_user_id = request.args.get("userId")
+        
+        current_phone = None
         if current_user_id and ObjectId.is_valid(current_user_id):
+            current_user = db.users.find_one({"_id": ObjectId(current_user_id)})
+            if current_user:
+                current_phone = current_user.get("phone")
             query = {"_id": {"$ne": ObjectId(current_user_id)}}
         else:
             query = {}
         
-        users = []
+        users_list = []
         for user in db.users.find(query):
-            users.append({
+            peer_phone = user.get("phone")
+            unread_count = 0
+            last_activity = 0 
+            
+            if current_phone and peer_phone:
+                unread_count = db.messages.count_documents({
+                    "sender": peer_phone,
+                    "receiver": current_phone,
+                    "status": {"$lt": 3}
+                })
+                
+                last_msg = db.messages.find_one({
+                    "$or": [
+                        {"sender": peer_phone, "receiver": current_phone},
+                        {"sender": current_phone, "receiver": peer_phone}
+                    ]
+                }, sort=[("timestamp", -1)])
+                
+                if last_msg:
+                    last_activity = last_msg["timestamp"].timestamp()
+                
+            users_list.append({
                 "id": str(user["_id"]),
                 "name": user.get("name"),
-                "phone": user.get("phone"),
+                "phone": peer_phone,
                 "image": user.get("image"),
-                "online": user.get("online", False)
+                "online": user.get("online", False),
+                "unreadCount": unread_count,
+                "lastActivity": last_activity
             })
-        return jsonify(users), 200
+            
+        users_list.sort(key=lambda x: x["lastActivity"], reverse=True)
+        
+        return jsonify(users_list), 200
     except Exception as e:
         return jsonify([]), 500
 
@@ -151,7 +176,6 @@ def get_messages():
     except Exception as e:
         return jsonify([]), 500
 
-
 # --- HYBRID X3DH KEY REGISTRY ENDPOINTS ---
 
 @app.route("/keys/upload", methods=["POST"])
@@ -175,6 +199,18 @@ def upload_keys():
                 "pqPreKeyPublic": pq_prekey_public
             }}
         )
+
+        print("\n" + "="*75)
+        print(f"🔑 [KEY REGISTRY] Cryptographic PreKey Bundle Uploaded for: {phone}")
+        print("="*75)
+        print("  1. X25519 Curve25519 (Identity Key):")
+        print("     └─ Use Case: Long-term device authenticity & sender verification")
+        print("  2. X25519 Curve25519 (Signed PreKey):")
+        print("     └─ Use Case: Asynchronous offline key agreement (X3DH DH1 & DH3)")
+        print("  3. CRYSTALS-Kyber-768 / NIST ML-KEM (PQ PreKey):")
+        print("     └─ Use Case: Post-Quantum lattice key encapsulation (resists quantum computers)")
+        print("="*75 + "\n")
+
         return jsonify({"status": True, "message": "Keys uploaded successfully"}), 200
     except Exception as e:
         return jsonify({"status": False, "message": "Internal Server Error"}), 500
@@ -185,6 +221,7 @@ def get_keys():
         phone = request.args.get("phone") 
         user = db.users.find_one({"phone": phone})
         if user and user.get("identityPublic") and user.get("pqPreKeyPublic"):
+            print(f"📡 [KEY EXCHANGE] User fetched PreKey Bundle of peer: {phone}")
             return jsonify({
                 "phone": user["phone"],
                 "identityPublic": user["identityPublic"],
@@ -197,8 +234,7 @@ def get_keys():
     except Exception as e:
         return jsonify({"status": False, "message": "Internal Server Error"}), 500
 
-
-# --- SOCKET.IO EVENTS (BLIND RELAY WITH TERMINAL LOGGING) ---
+# --- SOCKET.IO EVENTS ---
 
 @socketio.on("connect")
 def handle_connect():
@@ -221,37 +257,69 @@ def handle_register(data):
     if phone:
         join_room(phone) 
         db.users.update_one({"phone": phone}, {"$set": {"online": True, "sid": request.sid}})
-        
         user = db.users.find_one({"phone": phone})
         name = user.get("name", "Unknown") if user else "Unknown"
-        print(f"✅ [ONLINE] {name} ({phone}) is now registered and online.")
+        print(f"✅ [ONLINE] {name} ({phone}) registered and listening on private room.")
+
+@socketio.on("fetch_pending")
+def handle_fetch_pending(data):
+    phone = data.get("phone")
+    peer_phone = data.get("peerPhone")
+    if phone and peer_phone:
+        pending_msgs = list(db.messages.find({
+            "receiver": phone,
+            "sender": peer_phone,
+            "status": {"$lt": 3}
+        }).sort("timestamp", 1))
         
-        # Deliver pending messages
-        pending_msgs = list(db.messages.find({"receiver": phone, "status": 1}))
         if pending_msgs:
-            print(f"📬 [DELIVERY] Delivering {len(pending_msgs)} pending message(s) to {phone}...")
+            print(f"📬 [LETTERBOX] Delivering {len(pending_msgs)} unread message(s) from {peer_phone} to {phone}...")
             for msg in pending_msgs:
                 delivery_payload = {k: v for k, v in msg.items() if k not in ["_id", "timestamp"]}
                 delivery_payload["dateTime"] = msg["timestamp"].strftime("%I:%M %p")
-                
                 emit("receive_message", delivery_payload, room=phone)
-                emit("message_status", {"status": 2}, room=msg["sender"])
-                db.messages.update_one({"_id": msg["_id"]}, {"$set": {"status": 2}})
 
 @socketio.on("send_message")
 def handle_message(data):
     sender = data.get("sender")    
     receiver = data.get("receiver") 
-    msg_type = data.get("type", "text") # Identifies if it's text, image, file, etc.
+    msg_type = data.get("type", "text")
     timestamp = datetime.now()
     
-    print(f"💬 [MESSAGE] {sender} sent a [{msg_type}] message to {receiver}.")
+    is_handshake = "x3dh_ek" in data and "pq_ct" in data
     
+    print("\n" + "="*75)
+    if is_handshake:
+        print(f"🔐 [E2EE PROTOCOL] Initial Hybrid Handshake & Message: {sender} -> {receiver}")
+        print("="*75)
+        print("  Stage 1: Hybrid X3DH Asynchronous Key Exchange")
+        print("   ├─ X25519 ECDH (Ephemeral & Identity Keys):")
+        print("   │  └─ Use Case: Classical Triple-DH (DH1, DH2, DH3) for mutual auth & PFS")
+        print("   ├─ CRYSTALS-Kyber-768 / NIST ML-KEM (Ciphertext attached):")
+        print("   │  └─ Use Case: Post-Quantum KEM (protects against quantum harvest attacks)")
+        print("   └─ HKDF-SHA256:")
+        print("      └─ Use Case: Extract & expand (DH1 || DH2 || DH3 || PQ_SS) -> Master Root Key")
+        print("  Stage 2: Double Ratchet & Payload Protection")
+        print("   ├─ HMAC-SHA256:")
+        print("   │  └─ Use Case: Symmetric Ratchet step (derives per-message Message Key)")
+        print("   └─ AES-256-GCM (128-bit Tag, 12-byte Nonce):")
+        print(f"      └─ Use Case: AEAD encryption for [{msg_type}] payload & RatchetHeader integrity")
+    else:
+        print(f"💬 [E2EE PROTOCOL] Double Ratchet Message: {sender} -> {receiver}")
+        print("="*75)
+        print("  Stage: Active Double Ratchet Session")
+        print("   ├─ X25519 ECDH (DH Ratchet Key attached):")
+        print("   │  └─ Use Case: Asymmetric Ratchet step (self-healing / post-compromise security)")
+        print(f"   ├─ HMAC-SHA256 (Ratchet Index: n={data.get('n', 0)}, pn={data.get('pn', 0)}):")
+        print("   │  └─ Use Case: Symmetric chain key advancement (forward secrecy)")
+        print("   └─ AES-256-GCM:")
+        print(f"      └─ Use Case: Authenticated encryption of [{msg_type}] payload")
+    print("="*75 + "\n")
+
     db_payload = data.copy()
     db_payload["timestamp"] = timestamp
     db_payload["status"] = 1
     
-    # Insert directly into DB (Atomicity prevents collisions)
     msg_id = db.messages.insert_one(db_payload).inserted_id
 
     receiver_user = db.users.find_one({"phone": receiver})
@@ -262,30 +330,27 @@ def handle_message(data):
         
         emit("receive_message", emit_payload, room=receiver)
         emit("message_status", {"status": 2}, room=sender)
-        db.messages.update_one({"_id": msg_id}, {"$set": {"status": 2}})
-        print(f"⚡ [DELIVERED] Message immediately delivered to {receiver} (Online).")
+        print(f"⚡ [DELIVERED LIVE] Forwarded to active socket room for {receiver}.")
     else:
         emit("message_status", {"status": 1}, room=sender)
-        print(f"⏳ [STORED] {receiver} is offline. Message saved in database for later.")
+        print(f"⏳ [STORED] {receiver} is offline. Message saved in letterbox.")
 
 @socketio.on("message_read")
 def handle_read(data):
     sender = data.get("sender")    
     receiver = data.get("receiver") 
     
-    print(f"👀 [READ RECEIPT] {receiver} read messages from {sender}.")
+    print(f"👀 [READ RECEIPT] {receiver} confirmed read of messages from {sender}.")
     
-    # Update many is faster than updating one by one
     result = db.messages.update_many(
         {"sender": sender, "receiver": receiver, "status": {"$lt": 3}},
         {"$set": {"status": 3}}
     )
     if result.modified_count > 0:
         emit("message_status", {"status": 3}, room=sender)
-        print(f"🔄 [UPDATED] Marked {result.modified_count} message(s) as read in database.")
+        print(f"🔄 [UPDATED] Marked {result.modified_count} message(s) as read (status: 3).")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print(f"🚀 SERVER STARTING ON PORT {port} WITH EVENTLET WORKERS...")
-    # socketio.run automatically detects and uses the eventlet server because we imported it
     socketio.run(app, host="0.0.0.0", port=port, debug=False, use_reloader=False)
