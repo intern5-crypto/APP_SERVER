@@ -25,7 +25,7 @@ socketio = SocketIO(
 )
 
 # --- DATABASE CONNECTION ---
-MONGO_URI = "mongodb+srv://Intership:rohan2004@cluster0.6rqtgnz.mongodb.net/"
+MONGO_URI = "mongodb+srv://internshipcrypto_db_user:vduMLTN62orV1XA1@cluster0.cbmvnom.mongodb.net/"
 client = MongoClient(
     MONGO_URI, 
     tlsCAFile=certifi.where(),
