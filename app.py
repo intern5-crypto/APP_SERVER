@@ -100,6 +100,22 @@ def api_login():
     except Exception as e:
         return jsonify({"status": False, "message": "Internal Server Error"}), 500
 
+# 🟢 NEW: Route to handle uploading a new profile picture from MainActivity
+@app.route("/update_profile", methods=["POST"])
+def update_profile():
+    try:
+        data = request.get_json(force=True)
+        phone = data.get("phone")
+        image = data.get("image")
+        
+        if phone and image:
+            db.users.update_one({"phone": phone}, {"$set": {"image": image}})
+            return jsonify({"status": True, "message": "Profile picture updated successfully"}), 200
+            
+        return jsonify({"status": False, "message": "Missing phone or image data"}), 400
+    except Exception as e:
+        return jsonify({"status": False, "message": "Internal Server Error"}), 500
+
 @app.route("/users", methods=["GET"])
 def get_users():
     try:
@@ -266,10 +282,11 @@ def handle_fetch_pending(data):
     phone = data.get("phone")
     peer_phone = data.get("peerPhone")
     if phone and peer_phone:
+        # 🟢 FIX: Fetch status 1 (Pending). If it is 2, MainActivity already decrypted it.
         pending_msgs = list(db.messages.find({
             "receiver": phone,
             "sender": peer_phone,
-            "status": {"$lt": 3}
+            "status": 1
         }).sort("timestamp", 1))
         
         if pending_msgs:
@@ -334,6 +351,16 @@ def handle_message(data):
     else:
         emit("message_status", {"status": 1}, room=sender)
         print(f"⏳ [STORED] {receiver} is offline. Message saved in letterbox.")
+
+# 🟢 NEW: Handles background decryption confirmation from MainActivity
+@socketio.on("message_delivered")
+def handle_delivered(data):
+    sender = data.get("sender")    
+    receiver = data.get("receiver") 
+    db.messages.update_many(
+        {"sender": sender, "receiver": receiver, "status": 1},
+        {"$set": {"status": 2}}
+    )
 
 @socketio.on("message_read")
 def handle_read(data):
